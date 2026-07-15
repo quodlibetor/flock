@@ -1,0 +1,6 @@
+[profile.default]
+# The integration tests spawn real `flock` child processes that hold locks for
+# a bounded time (SIGKILL-release probes wait up to 5s, held-lock holders sleep
+# then get killed). 20s is comfortably above the slowest legitimate test; three
+# strikes terminates a genuinely wedged test rather than hanging CI.
+slow-timeout = { period = "20s", terminate-after = 3 }
