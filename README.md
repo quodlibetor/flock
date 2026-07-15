@@ -24,6 +24,10 @@ easier to install.
 
 ## Usage
 
+`flock` has two forms, mirroring util-linux `flock(1)`.
+
+### Wrap mode — lock around a command
+
 ```
 flock [OPTIONS] <lockfile> <command> [args...]
 ```
@@ -43,6 +47,31 @@ flock -n /tmp/build.lock ./run-tests.sh
 flock -w 30 /tmp/build.lock ./run-tests.sh
 ```
 
+### Descriptor mode — lock an already-open fd
+
+```
+flock [OPTIONS] <fd>          # lock the inherited descriptor, then exit
+flock -u <fd>                 # release it
+```
+
+When the target is a bare integer and no command follows, `flock` takes the
+lock on that **already-open file descriptor** and exits immediately, leaving the
+lock held. This is the `exec 9>>lockfile; flock 9` shell idiom: the lock
+persists past `flock`'s exit because your shell's fd `9` still refers to the
+same open file description, and `flock(2)` only releases once every fd to that
+description is closed — i.e. when the shell exits or is `SIGKILL`ed. It's the
+drop-in replacement for hand-rolled `fcntl.flock`-on-fd helpers.
+
+```bash
+exec 9>>/tmp/build.lock   # open fd 9 on the lockfile
+flock -n 9 || exit 1      # take the lock (or bail if held); lock stays held
+# ... critical section; the lock is released automatically when this shell
+#     exits, even on SIGKILL ...
+flock -u 9                # optional: release explicitly while still running
+```
+
+Descriptor mode is unix-only (it relies on fd inheritance and `flock(2)`).
+
 ### Options
 
 | Flag | Description |
@@ -52,7 +81,8 @@ flock -w 30 /tmp/build.lock ./run-tests.sh
 | `-s`, `--shared` | Take a shared lock instead of an exclusive one. |
 | `-x`, `--exclusive` | Take an exclusive lock (the default; accepted for `flock(1)` parity). |
 | `-E`, `--conflict-exit-code <N>` | Exit code to use when `-n`/`-w` cannot acquire the lock (default `1`, matching util-linux). |
-| `--label <TEXT>` | Record a human-readable label in the holder sidecar so a waiter can report who holds the lock. |
+| `-u`, `--unlock` | Descriptor mode only: release the lock held on `<fd>` (`flock -u <fd>`). |
+| `--label <TEXT>` | Record a human-readable label in the holder sidecar so a waiter can report who holds the lock (wrap mode). |
 | `-v`, `--verbose` | Log lock waiting/acquisition to stderr. |
 
 ### Exit codes
@@ -66,8 +96,9 @@ flock -w 30 /tmp/build.lock ./run-tests.sh
 
 ### Holder diagnostics
 
-While the lock is held, `flock` writes a best-effort `<lockfile>.holder`
-sidecar containing the holder's pid, `--label`, start time, and lock mode. A
+In wrap mode, while the lock is held `flock` writes a best-effort
+`<lockfile>.holder` sidecar containing the holder's pid, `--label`, start time,
+and lock mode (descriptor mode has no path to write it and skips it). A
 waiter run with `-v` reports "held by …" from it. The sidecar is purely
 diagnostic — it is never consulted for mutual exclusion, so a stale sidecar
 left by a `SIGKILL`ed holder is harmless and is overwritten by the next holder.

@@ -368,6 +368,98 @@ fn holder_sidecar_reports_label() {
 }
 
 // ---------------------------------------------------------------------------
+// Descriptor mode: `flock <fd>` locks an inherited fd and returns, leaving the
+// lock held via the caller's still-open descriptor.
+// ---------------------------------------------------------------------------
+
+/// The lock taken on an inherited fd must outlive the tool's exit: it is held by
+/// the shell's fd, so another process opening the same file (its own OFD) is
+/// blocked even though the flock process has already returned.
+#[cfg(unix)]
+#[test]
+fn fd_mode_lock_survives_tool_exit() {
+    let dir = TempDir::new().unwrap();
+    let lockfile = dir.child("lock");
+    let _holder = FdHolder::spawn(lockfile.path(), &[]);
+
+    let probe = flock_cmd()
+        .arg("-n")
+        .arg(lockfile.path())
+        .args(["true"])
+        .status()
+        .unwrap();
+    check!(
+        probe.code() == Some(1),
+        "descriptor-mode lock must persist after the tool exits; probe = {probe:?}"
+    );
+}
+
+/// SIGKILLing the shell that holds fd 9 closes the fd, so the kernel releases
+/// the descriptor-mode lock — the same on-death guarantee as wrap mode, now for
+/// the fd form.
+#[cfg(unix)]
+#[test]
+fn fd_mode_sigkill_of_holder_releases() {
+    let dir = TempDir::new().unwrap();
+    let lockfile = dir.child("lock");
+    let mut holder = FdHolder::spawn(lockfile.path(), &[]);
+
+    check!(
+        !is_free(lockfile.path()),
+        "lock should be held before the kill"
+    );
+
+    holder.kill();
+
+    let start = Instant::now();
+    let status = flock_cmd()
+        .args(["-w", "5"])
+        .arg(lockfile.path())
+        .args(["true"])
+        .status()
+        .unwrap();
+    check!(
+        status.success(),
+        "descriptor-mode lock was not released on SIGKILL: waiter exited {status:?}"
+    );
+    check!(
+        start.elapsed() < Duration::from_secs(5),
+        "waiter took too long — fd lock likely leaked past death"
+    );
+}
+
+/// `flock -u <fd>` releases the lock explicitly while the holding shell is still
+/// alive (fd still open), proving the unlock — not process death — freed it.
+#[cfg(unix)]
+#[test]
+fn fd_mode_unlock_releases_while_holder_alive() {
+    let dir = TempDir::new().unwrap();
+    let lockfile = dir.child("lock");
+    let trigger = dir.child("trigger");
+
+    let bin = env!("CARGO_BIN_EXE_flock");
+    // Hold the lock until the trigger file appears, then unlock fd 9 and keep
+    // the fd open (still alive) so freeing can only be attributed to `-u`.
+    let tail = format!(
+        "while [ ! -f {trigger:?} ]; do sleep 0.05; done; {bin:?} -u 9; sleep 30",
+        trigger = trigger.path(),
+    );
+    let mut holder = FdHolder::spawn_script(lockfile.path(), &[], &tail);
+
+    check!(!is_free(lockfile.path()), "should be held before -u");
+
+    fs::write(trigger.path(), "go").unwrap();
+
+    wait_until(lockfile.path(), Duration::from_secs(5), is_free);
+    check!(
+        holder.child.try_wait().unwrap().is_none(),
+        "holder shell should still be alive after -u (unlock, not exit, freed the lock)"
+    );
+
+    holder.kill();
+}
+
+// ---------------------------------------------------------------------------
 // Test helpers.
 // ---------------------------------------------------------------------------
 
@@ -458,4 +550,50 @@ fn kill_group(child: &mut std::process::Child) {
     #[cfg(not(unix))]
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// A shell that opens fd 9 on the lockfile, locks it via the `flock` tool in
+/// descriptor mode (the tool exits, leaving the lock held by this shell's fd),
+/// then keeps the fd open. Spawned in its own process group; killed on drop.
+/// Unix only — it relies on shell fd redirection and fd inheritance.
+#[cfg(unix)]
+struct FdHolder {
+    child: std::process::Child,
+}
+
+#[cfg(unix)]
+impl FdHolder {
+    /// Lock fd 9, then hold it open by sleeping.
+    fn spawn(lockfile: &Path, flock_args: &[&str]) -> Self {
+        Self::spawn_script(lockfile, flock_args, "sleep 30")
+    }
+
+    /// Lock fd 9, then run `tail` (with fd 9 still open) — e.g. to unlock later.
+    fn spawn_script(lockfile: &Path, flock_args: &[&str], tail: &str) -> Self {
+        use std::os::unix::process::CommandExt as _;
+        let bin = env!("CARGO_BIN_EXE_flock");
+        // exec 9>>LOCK opens fd 9; `flock <args> 9` locks that OFD and exits,
+        // leaving the lock held via fd 9 for as long as this shell lives.
+        let script = format!(
+            "exec 9>>{lockfile:?}; {bin:?} {args} 9 || exit 3; {tail}",
+            args = flock_args.join(" "),
+        );
+        let mut cmd = ProcCommand::new("sh");
+        cmd.args(["-c", &script]).process_group(0);
+        let child = cmd.spawn().expect("spawn fd holder");
+        let holder = FdHolder { child };
+        wait_until_held(lockfile, Duration::from_secs(5));
+        holder
+    }
+
+    fn kill(&mut self) {
+        kill_group(&mut self.child);
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FdHolder {
+    fn drop(&mut self) {
+        kill_group(&mut self.child);
+    }
 }

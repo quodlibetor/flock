@@ -12,26 +12,43 @@
 //!   existence. The kernel releases it the instant the holding fd is closed —
 //!   including when the process dies to `SIGKILL`. There is no stale-lock file
 //!   to garbage-collect, and we never unlink the lockfile.
+//!
+//! Two forms, mirroring util-linux `flock(1)`:
+//!
+//! - **Wrap mode** — `flock [opts] <lockfile> <command> [args…]`: open/create
+//!   the lockfile, hold the lock for the child's lifetime, then release.
+//! - **Descriptor mode** — `flock [opts] <fd>` (a bare integer, no command):
+//!   take the lock on an already-open, inherited descriptor and exit
+//!   immediately, leaving the lock held. It survives our exit because the
+//!   caller's fd (the shell's `exec 9>>lockfile`) still refers to the same open
+//!   file description; `flock(2)` releases only once every fd to that OFD is
+//!   closed (shell exit / `SIGKILL`). `-u` releases explicitly.
 
 use std::fs::{OpenOptions, TryLockError};
 use std::io::{self, ErrorKind};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command as ProcCommand;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 
 mod holder;
 
-/// Run a command while holding an OS-managed file lock.
+/// Run a command while holding an OS-managed file lock, or lock an inherited
+/// file descriptor.
 ///
-/// Acquires an advisory lock on <lockfile> (creating it if absent, never
-/// truncating or deleting it), runs <command> as a child while the lock is
-/// held, then releases the lock when the child exits and propagates the
-/// child's exit status.
+/// Wrap mode — `flock [opts] <lockfile> <command> [args...]`: acquire an
+/// advisory lock on <lockfile> (creating it if absent, never truncating or
+/// deleting it), run <command> as a child while the lock is held, then release
+/// the lock when the child exits and propagate its exit status.
+///
+/// Descriptor mode — `flock [opts] <fd>` with no command: take the lock on the
+/// already-open descriptor <fd> and exit immediately, leaving the lock held via
+/// the caller's still-open fd (the `exec 9>>lockfile; flock 9` shell pattern).
+/// `flock -u <fd>` releases it.
 #[derive(Debug, Parser)]
 #[command(name = "flock", version, verbatim_doc_comment)]
 struct Opts {
@@ -67,19 +84,26 @@ struct Opts {
     #[arg(long, value_name = "TEXT")]
     label: Option<String>,
 
+    /// Drop a lock held on an inherited descriptor (descriptor mode only):
+    /// `flock -u <fd>`.
+    #[arg(short = 'u', long)]
+    unlock: bool,
+
     /// Log lock waiting/acquisition to stderr.
     #[arg(short = 'v', long)]
     verbose: bool,
 
-    /// File to lock. Created if absent; never truncated or unlinked.
-    lockfile: PathBuf,
+    /// Lock target: a file path (wrap mode, created if absent and never
+    /// truncated or unlinked) when a command follows, or a bare integer file
+    /// descriptor (descriptor mode) when no command follows.
+    target: String,
 
-    /// Command to run while the lock is held, plus its arguments.
+    /// Command to run while the lock is held, plus its arguments. Omit it to
+    /// use descriptor mode on <target>.
     #[arg(
         trailing_var_arg = true,
         allow_hyphen_values = true,
-        required = true,
-        num_args = 1..,
+        num_args = 0..,
         value_name = "COMMAND"
     )]
     command: Vec<String>,
@@ -105,15 +129,32 @@ const EXIT_CANNOT_EXECUTE: i32 = 126;
 const EXIT_COMMAND_NOT_FOUND: i32 = 127;
 
 fn run(opts: Opts) -> Result<i32> {
-    let file = open_lockfile(&opts.lockfile)
-        .with_context(|| format!("opening lock file {}", opts.lockfile.display()))?;
+    // Disambiguation matches util-linux: a bare integer with no command is a
+    // descriptor to lock; anything with a trailing command is wrap mode (so a
+    // file literally named "9" is lockable as `flock 9 <command>`).
+    if opts.command.is_empty() {
+        run_fd_mode(&opts)
+    } else {
+        if opts.unlock {
+            bail!("-u/--unlock is only valid in descriptor mode (no command)");
+        }
+        run_wrap_mode(&opts)
+    }
+}
+
+/// Wrap mode: hold the lock on `<lockfile>` for the child command's lifetime.
+fn run_wrap_mode(opts: &Opts) -> Result<i32> {
+    let lockfile = Path::new(&opts.target);
+    let file = open_lockfile(lockfile)
+        .with_context(|| format!("opening lock file {}", lockfile.display()))?;
 
     let started = Instant::now();
-    let acquired = acquire(&file, &opts).context("acquiring lock")?;
+    let desc = lockfile.display().to_string();
+    let acquired = acquire(&file, opts, &desc, Some(lockfile)).context("acquiring lock")?;
     if !acquired {
         // `flock(1)` is silent on a failed `-n`/`-w`; only speak when asked.
         if opts.verbose {
-            match holder::read(&opts.lockfile) {
+            match holder::read(lockfile) {
                 Some(info) => eprintln!("flock: failed to acquire lock (held by {info})"),
                 None => eprintln!("flock: failed to acquire lock"),
             }
@@ -130,7 +171,7 @@ fn run(opts: Opts) -> Result<i32> {
     // The lock is held as long as `file` is alive. The sidecar is purely
     // diagnostic and is dropped (removed) at the end of this scope, before the
     // lock's fd is closed. Neither is on the mutual-exclusion path.
-    let _holder = holder::write(&opts.lockfile, opts.label.as_deref(), opts.shared);
+    let _holder = holder::write(lockfile, opts.label.as_deref(), opts.shared);
 
     let status = ProcCommand::new(&opts.command[0])
         .args(&opts.command[1..])
@@ -150,6 +191,63 @@ fn run(opts: Opts) -> Result<i32> {
 
     // `_holder` and `file` drop here — sidecar removed, then lock released.
     Ok(code)
+}
+
+/// Descriptor mode: lock (or, with `-u`, unlock) an inherited fd, then return.
+///
+/// The lock is taken on the borrowed descriptor and left held; it persists past
+/// our exit because the caller still holds an fd to the same open file
+/// description. We wrap the fd in `ManuallyDrop<File>` so `File::drop` never
+/// `close(2)`s the caller's descriptor. (Even a stray close wouldn't release the
+/// lock while the caller's fd is open — `flock(2)` is per-OFD — but borrowing
+/// without owning is the correct model and avoids surprising the caller.)
+#[cfg(unix)]
+fn run_fd_mode(opts: &Opts) -> Result<i32> {
+    use std::mem::ManuallyDrop;
+    use std::os::unix::io::FromRawFd as _;
+
+    let fd: i32 = opts.target.parse().map_err(|_| {
+        anyhow::anyhow!(
+            "expected a command after the lock target, or a bare integer file \
+             descriptor for descriptor mode; got {:?}",
+            opts.target
+        )
+    })?;
+
+    // SAFETY: we borrow an fd the caller passed us. ManuallyDrop keeps
+    // `File::drop` from closing it; we never read/write it, only lock it.
+    let file = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+
+    if opts.unlock {
+        file.unlock()
+            .with_context(|| format!("unlocking fd {fd}"))?;
+        if opts.verbose {
+            eprintln!("flock: released lock on fd {fd}");
+        }
+        return Ok(0);
+    }
+
+    let desc = format!("fd {fd}");
+    let acquired =
+        acquire(&file, opts, &desc, None).with_context(|| format!("acquiring lock on fd {fd}"))?;
+    if !acquired {
+        if opts.verbose {
+            eprintln!("flock: failed to acquire lock on fd {fd}");
+        }
+        return Ok(opts.conflict_exit_code);
+    }
+    if opts.verbose {
+        eprintln!("flock: acquired lock on fd {fd}");
+    }
+    // Return with the lock held. `file` is ManuallyDrop, so leaving this scope
+    // does not close the caller's descriptor; the lock lives on until the
+    // caller's fd closes (shell exit / SIGKILL) or `flock -u <fd>` runs.
+    Ok(0)
+}
+
+#[cfg(not(unix))]
+fn run_fd_mode(_opts: &Opts) -> Result<i32> {
+    bail!("descriptor lock mode is only supported on unix");
 }
 
 /// Open (or create) the lock file. Never truncates it: the file is just an
@@ -174,9 +272,17 @@ fn open_lockfile(path: &Path) -> io::Result<std::fs::File> {
 
 /// Try to take the lock according to the blocking policy in `opts`.
 ///
+/// `desc` describes the lock target for `-v` messages; `holder_path`, when set
+/// (wrap mode), lets a verbose wait report the sidecar's holder.
+///
 /// Returns `Ok(true)` when the lock is held, `Ok(false)` when it could not be
 /// acquired under `-n`/`-w`, and `Err` only on an unexpected lock error.
-fn acquire(file: &std::fs::File, opts: &Opts) -> Result<bool> {
+fn acquire(
+    file: &std::fs::File,
+    opts: &Opts,
+    desc: &str,
+    holder_path: Option<&Path>,
+) -> Result<bool> {
     // A cheap non-blocking attempt first: it satisfies `-n`, gives `-w` a
     // fast path, and lets the common uncontended case skip the helper thread.
     match try_lock(file, opts.shared)? {
@@ -188,7 +294,7 @@ fn acquire(file: &std::fs::File, opts: &Opts) -> Result<bool> {
     let Some(timeout) = opts.timeout else {
         // Block indefinitely on this thread.
         if opts.verbose {
-            eprint_waiting(&opts.lockfile);
+            eprint_waiting(desc, holder_path);
         }
         blocking_lock(file, opts.shared)?;
         return Ok(true);
@@ -198,7 +304,7 @@ fn acquire(file: &std::fs::File, opts: &Opts) -> Result<bool> {
         return Ok(false);
     }
     if opts.verbose {
-        eprint_waiting(&opts.lockfile);
+        eprint_waiting(desc, holder_path);
     }
     lock_with_timeout(file, opts.shared, Duration::from_secs_f64(timeout))
 }
@@ -268,13 +374,10 @@ fn lock_with_timeout(file: &std::fs::File, shared: bool, timeout: Duration) -> R
     }
 }
 
-fn eprint_waiting(lockfile: &Path) {
-    match holder::read(lockfile) {
-        Some(info) => eprintln!(
-            "flock: waiting for lock on {} (held by {info})",
-            lockfile.display()
-        ),
-        None => eprintln!("flock: waiting for lock on {}", lockfile.display()),
+fn eprint_waiting(desc: &str, holder_path: Option<&Path>) {
+    match holder_path.and_then(holder::read) {
+        Some(info) => eprintln!("flock: waiting for lock on {desc} (held by {info})"),
+        None => eprintln!("flock: waiting for lock on {desc}"),
     }
 }
 
