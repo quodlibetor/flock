@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.0.2](https://github.com/quodlibetor/flock/compare/v0.0.1...v0.0.2) - 2026-07-15
+
+### 🚀 Features
+
+- descriptor mode: lock an inherited fd (flock <fd>) by [@quodlibetor](https://github.com/quodlibetor) in [bf7b697](https://github.com/quodlibetor/flock/commit/bf7b6971460cb43ff576d1e5c53160c54e95421a)
+
 ## [0.0.1] - 2026-07-15
 
 ### 🚀 Features
