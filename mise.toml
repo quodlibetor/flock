@@ -1,0 +1,47 @@
+[settings]
+lockfile = true
+
+[tools]
+"cargo:cargo-llvm-cov" = "latest"
+"cargo:cargo-nextest" = "latest"
+"cargo:cargo-release" = "latest"
+"github:axodotdev/cargo-dist" = { version = "0.31", exe = "dist" }
+gh = "latest"
+git-cliff = "latest"
+
+[tasks.test]
+description = "Run the full test suite (unit + integration)"
+env = { CLICOLOR = "1" }
+run = '''cargo nextest run --no-fail-fast "$@"'''
+
+[tasks.test-unit]
+description = "Run unit tests only (excludes the integration binary)"
+env = { CLICOLOR = "1" }
+run = '''cargo nextest run --no-fail-fast -E 'not binary(integration)' "$@"'''
+
+[tasks.test-int]
+description = "Run integration tests only (spawns real flock processes)"
+env = { CLICOLOR = "1" }
+run = '''cargo nextest run --no-fail-fast -E 'binary(integration)' "$@"'''
+
+[tasks.cov-unit]
+description = """
+Coverage of all unit tests (no integration).
+"""
+env = { CLICOLOR = "1" }
+run = """
+cargo llvm-cov nextest --no-fail-fast --ignore-filename-regex 'tests/' -E 'not binary(integration)'
+cargo llvm-cov report --color=always
+cargo llvm-cov report --html
+"""
+
+[tasks.cov-all]
+description = """
+Coverage of unit + integration tests.
+"""
+env = { CLICOLOR = "1" }
+run = '''
+cargo llvm-cov nextest --no-fail-fast --show-missing-lines --ignore-filename-regex 'tests/'
+cargo llvm-cov report --color=always
+cargo llvm-cov report --html
+'''
