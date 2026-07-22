@@ -72,6 +72,55 @@ flock -u 9                # optional: release explicitly while still running
 
 Descriptor mode is unix-only (it relies on fd inheritance and `flock(2)`).
 
+### Weighted mode — a token pool instead of a plain lock
+
+```
+flock --tokens K --pool N <lockfile> <command> [args...]
+```
+
+Instead of one exclusive lock, `--tokens K --pool N` treats the lockfile as a
+counting semaphore of `N` tokens and takes `K` of them for the child's
+lifetime. This serializes a shared resource by *weight* rather than by "one
+command at a time":
+
+- `K < N` is a **shared reader** — several run concurrently as long as their
+  tokens sum to at most `N`.
+- `K == N` is a **writer** — it drains the whole pool, so it is exclusive.
+- A reader that would push the pool past `N` waits (or, with `-n`/`-w`, fails)
+  until enough tokens free up.
+
+```bash
+# 16-token pool: a unit suite takes ~5, a big run takes all 16.
+flock --tokens 5  --pool 16 /tmp/box.lock ./unit-tests.sh    # shared
+flock --tokens 16 --pool 16 /tmp/box.lock ./full-e2e.sh      # exclusive
+```
+
+**No writer starvation.** A full-pool writer publishes intent on an entry gate
+and holds it for the duration; new readers block at the gate, so the pool
+drains and the writer acquires within one drain rather than being starved by a
+continuous reader stream.
+
+**Death-safety is unchanged.** Every token is an open fd with a kernel lock, so
+a `SIGKILL`ed holder frees all of its tokens immediately — no stale slot files
+to garbage-collect.
+
+**Interoperates with plain exclusive holders.** Weighted mode keeps the main
+lockfile itself in the protocol: readers hold it *shared*, a full-pool writer
+holds it *exclusive*. So a process taking a plain `flock <lockfile>` exclusive
+lock (e.g. an older binary that predates `--tokens`) blocks every token holder,
+and any token holder blocks it. Old and new callers stay mutually correct on
+the same lockfile — but all callers that *do* use weighted mode must pass the
+**same `--pool`**, since the pool size defines the slot set.
+
+Derived paths: weighted mode creates siblings of the lockfile —
+`<lockfile>.intent` (the writer-preference entry gate), `<lockfile>.alloc` (a
+brief internal slot-allocator mutex), and `<lockfile>.slots/NN` (the `N` slot
+files). Like the lockfile, they are created on demand and never unlinked.
+
+Weighted mode is wrap mode only (it has no descriptor-mode form). On Windows the
+locks are `LockFileEx`-based like the rest of the tool; the concurrency proofs
+in the test suite are exercised on unix.
+
 ### Options
 
 | Flag | Description |
@@ -80,6 +129,8 @@ Descriptor mode is unix-only (it relies on fd inheritance and `flock(2)`).
 | `-w`, `--timeout <SECONDS>` | Wait at most `SECONDS` (fractional allowed) for the lock, then fail with the conflict code. |
 | `-s`, `--shared` | Take a shared lock instead of an exclusive one. |
 | `-x`, `--exclusive` | Take an exclusive lock (the default; accepted for `flock(1)` parity). |
+| `--tokens <K>` | Weighted mode: take `K` tokens from the `--pool` (wrap mode only). `K == N` is exclusive. Requires `--pool`. |
+| `--pool <N>` | Weighted-mode pool size. All callers sharing a lockfile must pass the same value. Requires `--tokens`. |
 | `-E`, `--conflict-exit-code <N>` | Exit code to use when `-n`/`-w` cannot acquire the lock (default `1`, matching util-linux). |
 | `-u`, `--unlock` | Descriptor mode only: release the lock held on `<fd>` (`flock -u <fd>`). |
 | `--label <TEXT>` | Record a human-readable label in the holder sidecar so a waiter can report who holds the lock (wrap mode). |

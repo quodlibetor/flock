@@ -36,6 +36,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 
 mod holder;
+mod pool;
 
 /// Run a command while holding an OS-managed file lock, or lock an inherited
 /// file descriptor.
@@ -69,6 +70,18 @@ struct Opts {
     /// Take an exclusive lock (the default; accepted for `flock(1)` parity).
     #[arg(short = 'x', long)]
     exclusive: bool,
+
+    /// Weighted mode: acquire this many tokens from the `--pool` on the
+    /// lockfile instead of a plain exclusive lock. `--tokens == --pool` drains
+    /// the pool and is exclusive; fewer is a shared reader. Wrap mode only.
+    /// All callers sharing a lockfile must pass the same `--pool`.
+    #[arg(long, value_name = "K", requires = "pool")]
+    tokens: Option<usize>,
+
+    /// Total token-pool size on this lockfile (weighted mode). Requires
+    /// `--tokens`.
+    #[arg(long, value_name = "N", requires = "tokens")]
+    pool: Option<usize>,
 
     /// Exit code to use when `-n`/`-w` cannot acquire the lock.
     #[arg(
@@ -133,6 +146,9 @@ fn run(opts: Opts) -> Result<i32> {
     // descriptor to lock; anything with a trailing command is wrap mode (so a
     // file literally named "9" is lockable as `flock 9 <command>`).
     if opts.command.is_empty() {
+        if opts.tokens.is_some() {
+            bail!("--tokens/--pool need a command (weighted mode is wrap mode only)");
+        }
         run_fd_mode(&opts)
     } else {
         if opts.unlock {
@@ -142,12 +158,21 @@ fn run(opts: Opts) -> Result<i32> {
     }
 }
 
-/// Wrap mode: hold the lock on `<lockfile>` for the child command's lifetime.
+/// Wrap mode: hold a lock on `<lockfile>` for the child command's lifetime.
+/// Plain exclusive by default; weighted (`--tokens`/`--pool`) when asked.
 fn run_wrap_mode(opts: &Opts) -> Result<i32> {
     let lockfile = Path::new(&opts.target);
     let file = open_lockfile(lockfile)
         .with_context(|| format!("opening lock file {}", lockfile.display()))?;
 
+    if let (Some(tokens), Some(pool)) = (opts.tokens, opts.pool) {
+        return run_wrap_weighted(opts, lockfile, file, tokens, pool);
+    }
+    run_wrap_exclusive(opts, lockfile, file)
+}
+
+/// Plain exclusive wrap mode — the original behaviour, unchanged.
+fn run_wrap_exclusive(opts: &Opts, lockfile: &Path, file: std::fs::File) -> Result<i32> {
     let started = Instant::now();
     let desc = lockfile.display().to_string();
     let acquired = acquire(&file, opts, &desc, Some(lockfile)).context("acquiring lock")?;
@@ -173,11 +198,74 @@ fn run_wrap_mode(opts: &Opts) -> Result<i32> {
     // lock's fd is closed. Neither is on the mutual-exclusion path.
     let _holder = holder::write(lockfile, opts.label.as_deref(), opts.shared);
 
-    let status = ProcCommand::new(&opts.command[0])
-        .args(&opts.command[1..])
-        .status();
+    let code = run_child(opts);
 
-    let code = match status {
+    // `_holder` and `file` drop here — sidecar removed, then lock released.
+    Ok(code)
+}
+
+/// Weighted wrap mode — acquire `tokens` of a `pool` (see `pool.rs`), run the
+/// child while holding them, then release. `tokens == pool` is exclusive.
+fn run_wrap_weighted(
+    opts: &Opts,
+    lockfile: &Path,
+    file: std::fs::File,
+    tokens: usize,
+    pool: usize,
+) -> Result<i32> {
+    if pool == 0 {
+        bail!("--pool must be at least 1");
+    }
+    if tokens == 0 || tokens > pool {
+        bail!("--tokens must be between 1 and --pool ({pool}); got {tokens}");
+    }
+
+    let started = Instant::now();
+    let blocking = pool::Blocking::from_opts(opts.nonblock, opts.timeout);
+    let held = pool::acquire(lockfile, file, tokens, pool, blocking, opts.verbose)
+        .context("acquiring weighted lock")?;
+    let Some(held) = held else {
+        if opts.verbose {
+            match holder::read(lockfile) {
+                Some(info) => {
+                    eprintln!("flock: failed to acquire {tokens}/{pool} tokens (held by {info})")
+                }
+                None => eprintln!("flock: failed to acquire {tokens}/{pool} tokens"),
+            }
+        }
+        return Ok(opts.conflict_exit_code);
+    };
+    if opts.verbose {
+        eprintln!(
+            "flock: acquired {tokens}/{pool} tokens after {:.3}s",
+            started.elapsed().as_secs_f64()
+        );
+    }
+
+    // A reader (tokens < pool) holds the resource lock shared; a full-pool
+    // writer holds it exclusive. Record that in the diagnostic sidecar.
+    let _holder = holder::write(lockfile, opts.label.as_deref(), tokens < pool);
+
+    let code = run_child(opts);
+
+    // Same order as run_wrap_exclusive: remove the sidecar BEFORE releasing the
+    // tokens. The sidecar is advisory-only, but releasing first would open a
+    // window where a successor acquires the freed tokens and writes its own
+    // sidecar, which our Guard drop would then delete — briefly hiding a live
+    // run from -v/reaper reporting. Dropping in this explicit order (not by
+    // scope end) keeps the intent obvious.
+    drop(_holder); // sidecar removed
+    drop(held); // then release every token fd (the kernel would too, on death)
+    Ok(code)
+}
+
+/// Spawn the child command and map its outcome to the exit code `flock` should
+/// return. Shared by every wrap-mode path.
+fn run_child(opts: &Opts) -> i32 {
+    match ProcCommand::new(&opts.command[0])
+        .args(&opts.command[1..])
+        .status()
+    {
         Ok(status) => exit_code_of(status),
         Err(err) => {
             eprintln!("flock: {}: {}", opts.command[0], err);
@@ -187,10 +275,7 @@ fn run_wrap_mode(opts: &Opts) -> Result<i32> {
                 _ => EXIT_CANNOT_EXECUTE,
             }
         }
-    };
-
-    // `_holder` and `file` drop here — sidecar removed, then lock released.
-    Ok(code)
+    }
 }
 
 /// Descriptor mode: lock (or, with `-u`, unlock) an inherited fd, then return.
@@ -254,7 +339,7 @@ fn run_fd_mode(_opts: &Opts) -> Result<i32> {
 /// inode to hang the kernel lock on, and truncating it would race with other
 /// holders. Falls back to read-only if the path can't be opened writable
 /// (e.g. a read-only filesystem or a directory used purely as a lock target).
-fn open_lockfile(path: &Path) -> io::Result<std::fs::File> {
+pub(crate) fn open_lockfile(path: &Path) -> io::Result<std::fs::File> {
     // `truncate(false)` is load-bearing: the lockfile is just an inode to hang
     // the kernel lock on. Truncating it on open would both discard any holder
     // content and race with concurrent openers.
@@ -314,7 +399,7 @@ fn acquire(
 /// std's `try_lock`/`try_lock_shared` distinguish contention
 /// (`TryLockError::WouldBlock`) from a genuine I/O failure
 /// (`TryLockError::Error`); only the former is a lock conflict.
-fn try_lock(file: &std::fs::File, shared: bool) -> Result<bool> {
+pub(crate) fn try_lock(file: &std::fs::File, shared: bool) -> Result<bool> {
     let res = if shared {
         file.try_lock_shared()
     } else {
@@ -327,7 +412,7 @@ fn try_lock(file: &std::fs::File, shared: bool) -> Result<bool> {
     }
 }
 
-fn blocking_lock(file: &std::fs::File, shared: bool) -> Result<()> {
+pub(crate) fn blocking_lock(file: &std::fs::File, shared: bool) -> Result<()> {
     if shared {
         file.lock_shared()?
     } else {
@@ -343,7 +428,11 @@ fn blocking_lock(file: &std::fs::File, shared: bool) -> Result<()> {
 /// abandon the helper: `main` returns the conflict code and the process exits,
 /// which closes the fd and releases anything the helper may have raced to grab.
 /// Because the lock lives on the fd, no lock can leak past our exit.
-fn lock_with_timeout(file: &std::fs::File, shared: bool, timeout: Duration) -> Result<bool> {
+pub(crate) fn lock_with_timeout(
+    file: &std::fs::File,
+    shared: bool,
+    timeout: Duration,
+) -> Result<bool> {
     // The helper needs the same open file description. `try_clone` dups the fd;
     // std documents that the lock is shared across dups and released only once
     // this file and every dup are closed — both fds are dropped before this
