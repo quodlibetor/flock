@@ -22,7 +22,9 @@
 //!   immediately, leaving the lock held. It survives our exit because the
 //!   caller's fd (the shell's `exec 9>>lockfile`) still refers to the same open
 //!   file description; `flock(2)` releases only once every fd to that OFD is
-//!   closed (shell exit / `SIGKILL`). `-u` releases explicitly.
+//!   closed (shell exit / `SIGKILL`). `-u` releases explicitly. Weighted
+//!   (`--tokens`/`--pool`) acquisition works here too, on caller-inherited fds
+//!   (`--lock-fd`, plus `--slot-fds` for a `K < N` reader) — see `run_fd_weighted`.
 
 use std::fs::{OpenOptions, TryLockError};
 use std::io::{self, ErrorKind};
@@ -73,8 +75,9 @@ struct Opts {
 
     /// Weighted mode: acquire this many tokens from the `--pool` on the
     /// lockfile instead of a plain exclusive lock. `--tokens == --pool` drains
-    /// the pool and is exclusive; fewer is a shared reader. Wrap mode only.
-    /// All callers sharing a lockfile must pass the same `--pool`.
+    /// the pool and is exclusive; fewer is a shared reader. Works in wrap mode
+    /// (with a command) and descriptor mode (with `--lock-fd`). All callers
+    /// sharing a lockfile must pass the same `--pool`.
     #[arg(long, value_name = "K", requires = "pool")]
     tokens: Option<usize>,
 
@@ -82,6 +85,20 @@ struct Opts {
     /// `--tokens`.
     #[arg(long, value_name = "N", requires = "tokens")]
     pool: Option<usize>,
+
+    /// Descriptor-mode weighted acquire: the caller's inherited fd on the
+    /// lockfile itself (the resource lock). Required for `--tokens`/`--pool`
+    /// with no command. See the README's descriptor-mode section.
+    #[arg(long, value_name = "FD", requires = "tokens")]
+    lock_fd: Option<i32>,
+
+    /// Descriptor-mode weighted reader (`--tokens` < `--pool`): the caller's
+    /// inherited fds on the `N` slot files (`<lockfile>.slots/00`..), in slot
+    /// order. Accepts an inclusive range `FIRST-LAST` or a comma list
+    /// `A,B,C`; must supply exactly `--pool` descriptors. Omit for a full-pool
+    /// writer (`--tokens == --pool`), which takes no slots.
+    #[arg(long, value_name = "SPEC", requires = "lock_fd")]
+    slot_fds: Option<String>,
 
     /// Exit code to use when `-n`/`-w` cannot acquire the lock.
     #[arg(
@@ -147,12 +164,26 @@ fn run(opts: Opts) -> Result<i32> {
     // file literally named "9" is lockable as `flock 9 <command>`).
     if opts.command.is_empty() {
         if opts.tokens.is_some() {
-            bail!("--tokens/--pool need a command (weighted mode is wrap mode only)");
+            if opts.unlock {
+                // A weighted descriptor pool is released the same way any
+                // descriptor lock is: by closing the fds (shell exit) or a
+                // plain `flock -u <fd>` on each held descriptor. There is no
+                // token bookkeeping to undo, so `-u` needs no `--tokens`.
+                bail!(
+                    "release a weighted descriptor pool by closing the fds, or run \
+                     `flock -u <fd>` on each held descriptor (main + each slot); \
+                     -u does not take --tokens"
+                );
+            }
+            return run_fd_weighted(&opts);
         }
         run_fd_mode(&opts)
     } else {
         if opts.unlock {
             bail!("-u/--unlock is only valid in descriptor mode (no command)");
+        }
+        if opts.lock_fd.is_some() || opts.slot_fds.is_some() {
+            bail!("--lock-fd/--slot-fds are descriptor-mode only (no command)");
         }
         run_wrap_mode(&opts)
     }
@@ -333,6 +364,122 @@ fn run_fd_mode(opts: &Opts) -> Result<i32> {
 #[cfg(not(unix))]
 fn run_fd_mode(_opts: &Opts) -> Result<i32> {
     bail!("descriptor lock mode is only supported on unix");
+}
+
+/// Descriptor-mode weighted acquire: `flock --tokens K --pool N --lock-fd <fd>
+/// [--slot-fds <spec>] <lockfile>` with no command. The `<lockfile>` positional
+/// names the pool (so `.intent`/`.alloc`/`.slots` are found next to it, exactly
+/// as in wrap mode — the two modes interoperate on one pool); the caller's
+/// inherited fds carry the locks that must outlive us. Returns with those locks
+/// held; the caller releases by closing the fds or `flock -u <fd>` per fd.
+fn run_fd_weighted(opts: &Opts) -> Result<i32> {
+    let (tokens, pool) = (
+        opts.tokens.expect("run_fd_weighted requires --tokens"),
+        opts.pool.expect("--tokens requires --pool"),
+    );
+    if pool == 0 {
+        bail!("--pool must be at least 1");
+    }
+    if tokens == 0 || tokens > pool {
+        bail!("--tokens must be between 1 and --pool ({pool}); got {tokens}");
+    }
+    let Some(lock_fd) = opts.lock_fd else {
+        bail!(
+            "weighted descriptor mode needs --lock-fd <fd> (the caller's inherited \
+             fd on the lockfile); see the README's descriptor-mode section"
+        );
+    };
+
+    // A writer drains the whole pool via the exclusive main lock and takes no
+    // slots; a reader needs exactly `pool` inherited slot fds.
+    let slot_fds = match (&opts.slot_fds, tokens == pool) {
+        (Some(_), true) => {
+            bail!("a full-pool writer (--tokens == --pool) takes no slots; omit --slot-fds")
+        }
+        (Some(spec), false) => {
+            let fds =
+                parse_fd_spec(spec).with_context(|| format!("parsing --slot-fds {spec:?}"))?;
+            if fds.len() != pool {
+                bail!(
+                    "--slot-fds must list exactly --pool ({pool}) descriptors; got {}",
+                    fds.len()
+                );
+            }
+            fds
+        }
+        (None, false) => bail!(
+            "a weighted reader (--tokens < --pool) needs --slot-fds listing the \
+             caller's inherited fds on the {pool} slot files"
+        ),
+        (None, true) => Vec::new(),
+    };
+
+    let lockfile = Path::new(&opts.target);
+    let started = Instant::now();
+    let blocking = pool::Blocking::from_opts(opts.nonblock, opts.timeout);
+    let held = pool::acquire_fd(
+        lockfile,
+        lock_fd,
+        &slot_fds,
+        tokens,
+        pool,
+        blocking,
+        opts.verbose,
+    )
+    .context("acquiring weighted lock on inherited descriptors")?;
+
+    let Some(indices) = held else {
+        if opts.verbose {
+            eprintln!("flock: failed to acquire {tokens}/{pool} tokens on inherited fds");
+        }
+        return Ok(opts.conflict_exit_code);
+    };
+
+    // Report the slot fds we locked so the caller knows which descriptors now
+    // carry tokens (the un-listed slot fds it opened are still free and can be
+    // closed). A writer holds only the main fd, so it prints nothing here.
+    if !indices.is_empty() {
+        let held_fds: Vec<String> = indices.iter().map(|&i| slot_fds[i].to_string()).collect();
+        println!("{}", held_fds.join(" "));
+    }
+    if opts.verbose {
+        eprintln!(
+            "flock: acquired {tokens}/{pool} tokens on inherited fds after {:.3}s",
+            started.elapsed().as_secs_f64()
+        );
+    }
+    // Return with the locks held on the caller's inherited fds. They persist
+    // until the caller closes those fds (shell exit / SIGKILL) or unlocks them.
+    Ok(0)
+}
+
+/// Parse a `--slot-fds` spec: an inclusive range `FIRST-LAST` (e.g. `10-25`) or
+/// a comma list `A,B,C`. Both forms yield the fd numbers in the order a reader
+/// should treat as slot 0, slot 1, … A range is the ergonomic form for the
+/// shell helper (`--slot-fds 10-$((10 + N - 1))`).
+fn parse_fd_spec(spec: &str) -> Result<Vec<i32>> {
+    let spec = spec.trim();
+    if let Some((first, last)) = spec.split_once('-') {
+        let first: i32 = first
+            .trim()
+            .parse()
+            .with_context(|| format!("range start {first:?} is not an integer"))?;
+        let last: i32 = last
+            .trim()
+            .parse()
+            .with_context(|| format!("range end {last:?} is not an integer"))?;
+        if last < first {
+            bail!("range end {last} is below its start {first}");
+        }
+        return Ok((first..=last).collect());
+    }
+    spec.split(',')
+        .map(|s| {
+            s.trim()
+                .parse::<i32>()
+                .with_context(|| format!("{s:?} is not an integer fd"))
+        })
+        .collect()
 }
 
 /// Open (or create) the lock file. Never truncates it: the file is just an

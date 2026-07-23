@@ -117,9 +117,73 @@ Derived paths: weighted mode creates siblings of the lockfile —
 brief internal slot-allocator mutex), and `<lockfile>.slots/NN` (the `N` slot
 files). Like the lockfile, they are created on demand and never unlinked.
 
-Weighted mode is wrap mode only (it has no descriptor-mode form). On Windows the
-locks are `LockFileEx`-based like the rest of the tool; the concurrency proofs
-in the test suite are exercised on unix.
+On Windows the locks are `LockFileEx`-based like the rest of the tool; the
+concurrency proofs in the test suite are exercised on unix.
+
+#### Weighted mode on an inherited descriptor
+
+Weighted mode works in descriptor mode too, so a shell can hold tokens on
+inherited fds — the same way `exec 9>lock; flock 9` holds a plain lock — and a
+pool can mix wrap-mode and descriptor-mode participants freely (they coordinate
+through the same `<lockfile>` and its siblings).
+
+A **full-pool writer** (`--tokens N --pool N`) needs only the main fd, because
+draining the pool *is* taking the main lock exclusive:
+
+```bash
+exec 9<>/tmp/box.lock
+flock --tokens 16 --pool 16 --lock-fd 9 /tmp/box.lock || exit 1
+# ... exclusive critical section; released when this shell exits or:
+flock -u 9
+```
+
+A **weighted reader** (`--tokens K` with `K < N`) needs `K` counted tokens, and
+each token is a lock on a distinct slot file that must outlive `flock`. Since a
+helper process cannot hand descriptors back to its parent, *the caller* pre-opens
+all `N` slot files as inherited fds; `flock` locks `K` free ones (the locks ride
+your fds past its exit) and prints the fd numbers it took:
+
+```bash
+lock=/tmp/box.lock
+exec 9<>"$lock"                 # fd 9: the main lock
+mkdir -p "$lock.slots"
+for i in $(seq 0 15); do        # fds 10..25: the 16 slot files, in order
+  printf -v slot '%02d' "$i"    # (bash; POSIX sh: slot=$(printf '%02d' "$i"))
+  eval "exec $((10 + i))<>\"$lock.slots/$slot\""
+done
+
+# Take 5 of 16 tokens. Prints the slot fds it locked, e.g. "10 11 12 13 14".
+flock --tokens 5 --pool 16 --lock-fd 9 --slot-fds 10-25 "$lock" || exit 1
+
+# ... shared critical section ...
+
+# Release by closing the fds (shell exit / SIGKILL) or explicitly per fd:
+for fd in 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25; do flock -u "$fd"; done
+```
+
+`--slot-fds` takes an inclusive range (`10-25`) or a comma list (`10,11,12`),
+listing exactly `--pool` descriptors in slot order (fd for slot `00`, slot `01`,
+…). Leaving the unused slot fds open is harmless — only a *locked* slot counts
+against the pool.
+
+**Acquisition is all-or-nothing.** On a refused `-n`/`-w`, `flock` releases
+every lock it took while trying — including the main-shared lock and any slot it
+had already swept — so a failed attempt leaves *none* of your descriptors
+locked. You never have to unwind a partial acquisition yourself; closing the fds
+on failure remains fine hygiene but is not required for correctness.
+
+**Descriptor/wrap equivalence.**
+
+It's possible to do everything with either the inhereted FD or wrap a command mode.
+The only asymmetry is the extra plumbing the fd form needs, and it
+is there for a verified reason:
+
+| Feature | Descriptor mode | Basis |
+|---|---|---|
+| `-s` / `-x` / `-n` / `-w` / `-u` | ✅ | Same `flock(2)` call on the inherited fd. |
+| Weighted full pool (`K == N`) | `--lock-fd` | The inherited main fd carries the exclusive lock; the writer-preference gate is held only while waiting. |
+| Weighted reader (`K < N`) | `--lock-fd` + `--slot-fds` (caller pre-opens `N` slot fds) | `K` tokens need `K` descriptors that outlive `flock`; a helper can't install fds into its parent, so the caller opens them. |
+
 
 ### Options
 
@@ -129,8 +193,10 @@ in the test suite are exercised on unix.
 | `-w`, `--timeout <SECONDS>` | Wait at most `SECONDS` (fractional allowed) for the lock, then fail with the conflict code. |
 | `-s`, `--shared` | Take a shared lock instead of an exclusive one. |
 | `-x`, `--exclusive` | Take an exclusive lock (the default; accepted for `flock(1)` parity). |
-| `--tokens <K>` | Weighted mode: take `K` tokens from the `--pool` (wrap mode only). `K == N` is exclusive. Requires `--pool`. |
+| `--tokens <K>` | Weighted mode: take `K` tokens from the `--pool`. `K == N` is exclusive. Requires `--pool`. Works in wrap mode (`<lockfile> <command>`) and descriptor mode (with `--lock-fd`). |
 | `--pool <N>` | Weighted-mode pool size. All callers sharing a lockfile must pass the same value. Requires `--tokens`. |
+| `--lock-fd <FD>` | Descriptor-mode weighted acquire: the caller's inherited fd on the lockfile itself. Requires `--tokens`. |
+| `--slot-fds <SPEC>` | Descriptor-mode weighted reader (`K < N`): the caller's inherited fds on the `N` slot files, in slot order — an inclusive range `FIRST-LAST` or a comma list. Requires `--lock-fd`. |
 | `-E`, `--conflict-exit-code <N>` | Exit code to use when `-n`/`-w` cannot acquire the lock (default `1`, matching util-linux). |
 | `-u`, `--unlock` | Descriptor mode only: release the lock held on `<fd>` (`flock -u <fd>`). |
 | `--label <TEXT>` | Record a human-readable label in the holder sidecar so a waiter can report who holds the lock (wrap mode). |

@@ -394,6 +394,32 @@ fn fd_mode_lock_survives_tool_exit() {
     );
 }
 
+/// A shared lock taken in descriptor mode coexists with another shared holder
+/// but still blocks an exclusive acquirer — the same `-s` semantics as wrap
+/// mode, now on an inherited fd.
+#[cfg(unix)]
+#[test]
+fn fd_mode_shared_coexists_but_blocks_exclusive() {
+    let dir = TempDir::new().unwrap();
+    let lockfile = dir.child("lock");
+    let _holder = FdHolder::spawn(lockfile.path(), &["-s"]);
+
+    // Another shared holder (also on its own inherited fd) fits alongside.
+    let _shared = FdHolder::spawn(lockfile.path(), &["-s"]);
+
+    // An exclusive acquirer is refused while shared locks are held.
+    let exclusive = flock_cmd()
+        .args(["-x", "-n"])
+        .arg(lockfile.path())
+        .args(["true"])
+        .status()
+        .unwrap();
+    check!(
+        exclusive.code() == Some(1),
+        "exclusive must be blocked by descriptor-mode shared holders"
+    );
+}
+
 /// SIGKILLing the shell that holds fd 9 closes the fd, so the kernel releases
 /// the descriptor-mode lock — the same on-death guarantee as wrap mode, now for
 /// the fd form.
