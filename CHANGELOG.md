@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.3](https://github.com/quodlibetor/flock/compare/v0.0.2...v0.0.3) - 2026-08-01
+
+### 🚀 Features
+
+- weighted token pool (--tokens K --pool N) with writer preference and legacy interop by [@quodlibetor](https://github.com/quodlibetor) in [86b879c](https://github.com/quodlibetor/flock/commit/86b879cc1311a03ce225fd07d591bd850c161c2c)
+- descriptor-mode parity for the weighted token pool by [@quodlibetor](https://github.com/quodlibetor) in [25baaa6](https://github.com/quodlibetor/flock/commit/25baaa6329620d5feb33d77f1787102a992a7d73)
+
 ## [0.0.2](https://github.com/quodlibetor/flock/compare/v0.0.1...v0.0.2) - 2026-07-15
 
 ### 🚀 Features
