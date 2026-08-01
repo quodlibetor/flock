@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.0.4](https://github.com/quodlibetor/flock/compare/v0.0.3...v0.0.4) - 2026-08-01
+
+### 🧪 Testing
+
+- make the suite pass on Linux, and add a way to run it there by [@quodlibetor](https://github.com/quodlibetor) in [421d276](https://github.com/quodlibetor/flock/commit/421d2768e752a205797e32639962cd63fa66c2c5)
+
 ## [0.0.3](https://github.com/quodlibetor/flock/compare/v0.0.2...v0.0.3) - 2026-08-01
 
 ### 🚀 Features
