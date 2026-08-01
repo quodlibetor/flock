@@ -1,0 +1,45 @@
+# syntax=docker/dockerfile:1
+#
+# Linux test image, driven by `mise run test-linux`. Build and run are two
+# separate docker commands: this file compiles the test binaries, and the run
+# only executes them.
+#
+# Why a Linux image at all when the tests pass on a mac: the suite drives real
+# shells, and Debian's /bin/sh is dash, not bash. Descriptor-mode tests hit the
+# POSIX rule dash enforces and bash does not — redirections may only name fds
+# 0-9. This is the environment CI runs in.
+#
+# Layer strategy (https://depot.dev/blog/rust-dockerfile-best-practices):
+#   1. cargo-chef — dependencies compile from a source-free skeleton, so editing
+#      this crate does not invalidate them.
+#   2. sccache on a BuildKit cache mount — per-crate artifacts survive even when
+#      a layer *is* invalidated (a Cargo.toml edit, a rebased recipe).
+# The cargo registry deliberately stays in the image layer rather than a cache
+# mount: `cargo nextest run` re-fingerprints dependency sources at run time, and
+# a cache mount is not there any more by then.
+
+FROM rust:1-bookworm AS base
+RUN cargo install sccache --version ^0.10 --locked \
+    && cargo install cargo-chef --version ^0.1 --locked \
+    && curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C /usr/local/cargo/bin
+ENV RUSTC_WRAPPER=sccache SCCACHE_DIR=/sccache
+WORKDIR /app
+
+FROM base AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM base AS builder
+COPY --from=planner /app/recipe.json recipe.json
+# Dependencies only — no crate source is present yet.
+RUN --mount=type=cache,target=/sccache,sharing=locked \
+    cargo chef cook --tests --recipe-path recipe.json
+COPY . .
+# Compile the test binaries but run nothing; `docker run` does the running.
+RUN --mount=type=cache,target=/sccache,sharing=locked \
+    cargo nextest run --no-run
+
+FROM builder AS test
+# sccache has no server at run time, and nothing should need compiling anyway.
+ENV RUSTC_WRAPPER=
+CMD ["cargo", "nextest", "run", "--no-fail-fast"]

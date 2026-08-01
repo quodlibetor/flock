@@ -1,0 +1,6 @@
+# Dockerfile.test does `COPY . .`; keep the build context to actual sources.
+# target/ holds host-architecture artifacts that the Linux build cannot use,
+# and the VCS dirs are large and irrelevant to compiling tests.
+target/
+.git/
+.jj/

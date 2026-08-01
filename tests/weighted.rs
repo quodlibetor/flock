@@ -62,7 +62,9 @@ fn wait_until(path: &Path, timeout: Duration, mut pred: impl FnMut(&Path) -> boo
 /// Spawn a token holder that holds `tokens/pool` for a `sleep`, in its own
 /// process group so the whole tree can be SIGKILLed together. Killed on drop.
 struct Reader {
-    child: Child,
+    /// `None` once killed — see [`kill_group`] on why a reaped child must not
+    /// be signalled a second time.
+    child: Option<Child>,
 }
 
 impl Reader {
@@ -77,34 +79,43 @@ impl Reader {
             cmd.process_group(0);
         }
         let child = cmd.spawn().expect("spawn reader");
-        let reader = Reader { child };
+        let reader = Reader { child: Some(child) };
         // Wait until it actually holds (main lock reads as not-free).
         wait_until(lockfile, Duration::from_secs(5), |p| !main_lock_free(p));
         reader
     }
 
     fn kill(&mut self) {
-        kill_group(&mut self.child);
+        if let Some(child) = self.child.take() {
+            kill_group(child);
+        }
     }
 }
 
 impl Drop for Reader {
     fn drop(&mut self) {
-        kill_group(&mut self.child);
+        self.kill();
     }
 }
 
-fn kill_group(child: &mut Child) {
+/// SIGKILL a holder's whole process group, then reap it.
+///
+/// `killpg(2)` directly rather than shelling out to `kill(1)`: which `kill`
+/// gets exec'd is the platform's, and they do not agree on `-KILL -<pgid>`.
+/// BSD's (macOS) kills the group; procps-ng's (Debian/Ubuntu, so CI and any
+/// Linux container) exits 1 there and left holders running — those runs stalled
+/// for the holder's whole `sleep` instead of killing it. The syscall has no
+/// argument parsing and no `PATH` to get wrong.
+///
+/// Takes the `Child` by value because reaping it frees its pid for reuse: a
+/// second `killpg` on the same number could land on an unrelated process group.
+fn kill_group(mut child: Child) {
     #[cfg(unix)]
-    {
-        let pid = child.id();
-        // A holder killed explicitly is killed again on drop; the second call
-        // finds no process. Swallow that expected noise.
-        let _ = ProcCommand::new("kill")
-            .arg("-KILL")
-            .arg(format!("-{pid}"))
-            .stderr(std::process::Stdio::null())
-            .status();
+    // SAFETY: killpg takes no pointers, so it cannot violate memory safety. A
+    // pgid that is already gone just returns ESRCH, which we ignore like any
+    // other error here.
+    unsafe {
+        libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
     }
     #[cfg(not(unix))]
     let _ = child.kill();
@@ -205,7 +216,7 @@ fn writer_waits_for_drain_then_wins_over_readers() {
         stop = stop.path(),
         lock = lockfile.path(),
     );
-    let mut stream = {
+    let stream = {
         let mut cmd = ProcCommand::new("sh");
         cmd.args(["-c", &loop_script]);
         #[cfg(unix)]
@@ -234,7 +245,7 @@ fn writer_waits_for_drain_then_wins_over_readers() {
 
     // Stop the stream and reap it.
     fs::write(stop.path(), "go").unwrap();
-    kill_group(&mut stream);
+    kill_group(stream);
 
     check!(
         writer.success(),

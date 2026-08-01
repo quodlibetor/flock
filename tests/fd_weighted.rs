@@ -65,21 +65,42 @@ fn wait_until(path: &Path, timeout: Duration, mut pred: impl FnMut(&Path) -> boo
     );
 }
 
-fn kill_group(child: &mut Child) {
-    let pid = child.id();
-    let _ = ProcCommand::new("kill")
-        .arg("-KILL")
-        .arg(format!("-{pid}"))
-        .stderr(Stdio::null())
-        .status();
+/// SIGKILL a holder's whole process group, then reap it.
+///
+/// `killpg(2)` directly rather than shelling out to `kill(1)`: which `kill`
+/// gets exec'd is the platform's, and they do not agree on `-KILL -<pgid>`.
+/// BSD's (macOS) kills the group; procps-ng's (Debian/Ubuntu, so CI and any
+/// Linux container) exits 1 there and left holders running — those runs stalled
+/// for the holder's whole `sleep` instead of killing it. The syscall has no
+/// argument parsing and no `PATH` to get wrong.
+///
+/// Takes the `Child` by value because reaping it frees its pid for reuse: a
+/// second `killpg` on the same number could land on an unrelated process group.
+fn kill_group(mut child: Child) {
+    #[cfg(unix)]
+    // SAFETY: killpg takes no pointers, so it cannot violate memory safety. A
+    // pgid that is already gone just returns ESRCH, which we ignore like any
+    // other error here.
+    unsafe {
+        libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
     let _ = child.wait();
 }
 
+/// First slot fd. POSIX `sh` only guarantees redirections on fds 0-9, and on
+/// Debian/Ubuntu `/bin/sh` is dash, which enforces that: `exec 10<>f` there is
+/// parsed as the *command* `10` (`sh: exec: 10: not found`). The tool itself
+/// takes any fd — but these harness shells must stay single-digit, so slots run
+/// 3..=8 and the main lock keeps fd 9. That caps a test pool at 6 slots.
+const SLOT_FD0: usize = 3;
+
 /// Build a POSIX-sh script that opens fd 9 on the lockfile and — for a reader —
-/// fds `10..10+pool` on the `pool` slot files, runs the fd-weighted acquire
-/// (with any `extra` flock flags, e.g. `-n`), and then runs `tail` with every fd
-/// still open. Slot fds are contiguous from 10 so `--slot-fds 10-<last>` names
-/// them in order.
+/// fds `SLOT_FD0..SLOT_FD0+pool` on the `pool` slot files, runs the fd-weighted
+/// acquire (with any `extra` flock flags, e.g. `-n`), and then runs `tail` with
+/// every fd still open. Slot fds are contiguous so `--slot-fds <first>-<last>`
+/// names them in order.
 fn holder_script(lock: &Path, tokens: usize, pool: usize, extra: &str, tail: &str) -> String {
     let bin = bin();
     let lock = lock.display();
@@ -91,18 +112,22 @@ fn holder_script(lock: &Path, tokens: usize, pool: usize, extra: &str, tail: &st
 {tail}"#
         )
     } else {
-        let last = 10 + pool - 1;
+        assert!(
+            pool <= 9 - SLOT_FD0,
+            "test pool must fit in fds {SLOT_FD0}-8"
+        );
+        let last = SLOT_FD0 + pool - 1;
         format!(
             r#"exec 9<>"{lock}"
 mkdir -p "{lock}.slots"
 i=0
 while [ $i -lt {pool} ]; do
-  fd=$(( 10 + i ))
+  fd=$(( {SLOT_FD0} + i ))
   slot=$(printf '%02d' "$i")
   eval "exec ${{fd}}<>\"{lock}.slots/${{slot}}\""
   i=$(( i + 1 ))
 done
-"{bin}" --tokens {tokens} --pool {pool} --lock-fd 9 --slot-fds 10-{last} {extra} "{lock}" || exit 3
+"{bin}" --tokens {tokens} --pool {pool} --lock-fd 9 --slot-fds {SLOT_FD0}-{last} {extra} "{lock}" || exit 3
 {tail}"#
         )
     }
@@ -112,7 +137,9 @@ done
 /// spawned in its own process group so the whole tree can be SIGKILLed. Killed
 /// on drop.
 struct FdHolder {
-    child: Child,
+    /// `None` once killed — see [`kill_group`] on why a reaped child must not
+    /// be signalled a second time.
+    child: Option<Child>,
 }
 
 impl FdHolder {
@@ -130,19 +157,28 @@ impl FdHolder {
             .stdout(Stdio::null())
             .process_group(0);
         let child = cmd.spawn().expect("spawn fd holder");
-        let holder = FdHolder { child };
+        let holder = FdHolder { child: Some(child) };
         wait_until(lock, Duration::from_secs(5), |p| !main_lock_free(p));
         holder
     }
 
     fn kill(&mut self) {
-        kill_group(&mut self.child);
+        if let Some(child) = self.child.take() {
+            kill_group(child);
+        }
+    }
+
+    /// Is the holding shell still running? Only meaningful before `kill`.
+    fn is_alive(&mut self) -> bool {
+        self.child
+            .as_mut()
+            .is_some_and(|c| c.try_wait().unwrap().is_none())
     }
 }
 
 impl Drop for FdHolder {
     fn drop(&mut self) {
-        kill_group(&mut self.child);
+        self.kill();
     }
 }
 
@@ -196,10 +232,11 @@ fn fd_reader_holds_shared_and_reports_slots() {
         "reader should report the 2 slot fds it locked; got {reported:?}"
     );
     for fd in &fds {
-        let n: i32 = fd.parse().expect("held fd should be an integer");
+        let n: usize = fd.parse().expect("held fd should be an integer");
+        let opened = SLOT_FD0..=SLOT_FD0 + 3;
         check!(
-            (10..=13).contains(&n),
-            "held fd {n} outside the opened 10-13"
+            opened.contains(&n),
+            "held fd {n} outside the opened {opened:?}"
         );
     }
 
@@ -238,7 +275,7 @@ fn fd_reader_interops_with_wrap_reader() {
     let _fd_reader = FdHolder::spawn(lock.path(), 2, 4);
 
     // A wrap reader for the last 2 slots fits.
-    let mut wrap_reader = {
+    let wrap_reader = {
         use std::os::unix::process::CommandExt as _;
         flock()
             .args(["--tokens", "2", "--pool", "4"])
@@ -263,7 +300,7 @@ fn fd_reader_interops_with_wrap_reader() {
         "pool should be full (2 fd + 2 wrap tokens); a further reader must be refused"
     );
 
-    kill_group(&mut wrap_reader);
+    kill_group(wrap_reader);
 }
 
 /// A full-pool writer on an inherited fd excludes a wrap-mode token reader.
@@ -293,7 +330,7 @@ fn wrap_tokens_exclude_fd_full_pool() {
     let lock = dir.child("lock");
 
     // A wrap reader holds main shared.
-    let mut wrap_reader = {
+    let wrap_reader = {
         use std::os::unix::process::CommandExt as _;
         flock()
             .args(["--tokens", "1", "--pool", "4"])
@@ -316,7 +353,7 @@ fn wrap_tokens_exclude_fd_full_pool() {
         "an fd full-pool writer must be refused while a wrap reader holds a token"
     );
 
-    kill_group(&mut wrap_reader);
+    kill_group(wrap_reader);
 }
 
 /// SIGKILLing the holding shell frees the main lock AND every slot it held: two
@@ -384,15 +421,16 @@ fn fd_refused_reader_leaves_no_residual() {
 mkdir -p "{lock}.slots"
 for i in 0 1 2 3; do
   slot=$(printf '%02d' "$i")
-  eval "exec $((10 + i))<>\"{lock}.slots/${{slot}}\""
+  eval "exec $(({SLOT_FD0} + i))<>\"{lock}.slots/${{slot}}\""
 done
-"{bin}" --tokens 2 --pool 4 -n --lock-fd 9 --slot-fds 10-13 "{lock}" && exit 9
+"{bin}" --tokens 2 --pool 4 -n --lock-fd 9 --slot-fds {SLOT_FD0}-{last} "{lock}" && exit 9
 : > "{ready}"
 sleep 30"#,
+        last = SLOT_FD0 + 3,
         lock = lock.path().display(),
         ready = ready.path().display(),
     );
-    let mut refused = {
+    let refused = {
         use std::os::unix::process::CommandExt as _;
         ProcCommand::new("sh")
             .args(["-c", &refused_script])
@@ -424,7 +462,7 @@ sleep 30"#,
 
     // No leaked slot: the whole 4-token pool is allocatable again. A 3-token
     // reader plus a 1-token reader fit only if all four slots are free.
-    let mut three = {
+    let three = {
         use std::os::unix::process::CommandExt as _;
         flock()
             .args(["--tokens", "3", "--pool", "4"])
@@ -446,8 +484,8 @@ sleep 30"#,
         "refused reader leaked a slot — the pool was one token short"
     );
 
-    kill_group(&mut three);
-    kill_group(&mut refused);
+    kill_group(three);
+    kill_group(refused);
 }
 
 /// `flock -u <fd>` on each held descriptor frees the tokens while the holding
@@ -459,13 +497,15 @@ fn fd_unlock_releases_while_holder_alive() {
     let trigger = dir.child("trigger");
     let bin = bin();
 
-    // Reader holds 2/4 on fds 9 (main) + 10-13 (slots). When the trigger
-    // appears, unlock the main fd and all slot fds, then keep the shell (and its
+    // Reader holds 2/4 on fds 9 (main) + 3-6 (slots). When the trigger appears,
+    // unlock the main fd and all slot fds, then keep the shell (and its
     // now-unlocked fds) alive so only `-u` can explain the release.
+    let slot_fds: Vec<String> = (SLOT_FD0..SLOT_FD0 + 4).map(|f| f.to_string()).collect();
     let tail = format!(
         r#"while [ ! -f "{trigger}" ]; do sleep 0.05; done
-for fd in 9 10 11 12 13; do "{bin}" -u "$fd"; done
+for fd in 9 {slots}; do "{bin}" -u "$fd"; done
 sleep 30"#,
+        slots = slot_fds.join(" "),
         trigger = trigger.path().display(),
     );
     let mut holder = FdHolder::spawn_tail(lock.path(), 2, 4, &tail);
@@ -475,7 +515,7 @@ sleep 30"#,
 
     wait_until(lock.path(), Duration::from_secs(5), main_lock_free);
     check!(
-        holder.child.try_wait().unwrap().is_none(),
+        holder.is_alive(),
         "holder shell should still be alive after -u (unlock, not exit, freed it)"
     );
 

@@ -478,7 +478,7 @@ fn fd_mode_unlock_releases_while_holder_alive() {
 
     wait_until(lockfile.path(), Duration::from_secs(5), is_free);
     check!(
-        holder.child.try_wait().unwrap().is_none(),
+        holder.is_alive(),
         "holder shell should still be alive after -u (unlock, not exit, freed the lock)"
     );
 
@@ -527,7 +527,9 @@ fn wait_until(path: &Path, timeout: Duration, mut pred: impl FnMut(&Path) -> boo
 /// its own process group so the whole group — flock and its `sleep` child — can
 /// be killed together without orphaning the grandchild. Killed on drop.
 struct Holder {
-    child: std::process::Child,
+    /// `None` once killed — see [`kill_group`] on why a reaped child must not
+    /// be signalled a second time.
+    child: Option<std::process::Child>,
 }
 
 impl Holder {
@@ -544,7 +546,7 @@ impl Holder {
             cmd.process_group(0);
         }
         let child = cmd.spawn().expect("spawn holder");
-        let holder = Holder { child };
+        let holder = Holder { child: Some(child) };
         wait_until_held(lockfile, Duration::from_secs(5));
         holder
     }
@@ -552,26 +554,36 @@ impl Holder {
     /// SIGKILL the holder's whole process group. flock dies to SIGKILL — the
     /// death-release path — and its `sleep` child dies with it (no orphan).
     fn kill(&mut self) {
-        kill_group(&mut self.child);
+        if let Some(child) = self.child.take() {
+            kill_group(child);
+        }
     }
 }
 
 impl Drop for Holder {
     fn drop(&mut self) {
-        kill_group(&mut self.child);
+        self.kill();
     }
 }
 
-fn kill_group(child: &mut std::process::Child) {
+/// SIGKILL a holder's whole process group, then reap it.
+///
+/// `killpg(2)` directly rather than shelling out to `kill(1)`: which `kill`
+/// gets exec'd is the platform's, and they do not agree on `-KILL -<pgid>`.
+/// BSD's (macOS) kills the group; procps-ng's (Debian/Ubuntu, so CI and any
+/// Linux container) exits 1 there and left holders running — those runs stalled
+/// for the holder's whole `sleep` instead of killing it. The syscall has no
+/// argument parsing and no `PATH` to get wrong.
+///
+/// Takes the `Child` by value because reaping it frees its pid for reuse: a
+/// second `killpg` on the same number could land on an unrelated process group.
+fn kill_group(mut child: std::process::Child) {
     #[cfg(unix)]
-    {
-        // Negative target = process group. The holder was spawned as its own
-        // group leader, so its pid is the pgid.
-        let pid = child.id();
-        let _ = ProcCommand::new("kill")
-            .arg("-KILL")
-            .arg(format!("-{pid}"))
-            .status();
+    // SAFETY: killpg takes no pointers, so it cannot violate memory safety. A
+    // pgid that is already gone just returns ESRCH, which we ignore like any
+    // other error here.
+    unsafe {
+        libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
     }
     #[cfg(not(unix))]
     let _ = child.kill();
@@ -584,7 +596,9 @@ fn kill_group(child: &mut std::process::Child) {
 /// Unix only — it relies on shell fd redirection and fd inheritance.
 #[cfg(unix)]
 struct FdHolder {
-    child: std::process::Child,
+    /// `None` once killed — see [`kill_group`] on why a reaped child must not
+    /// be signalled a second time.
+    child: Option<std::process::Child>,
 }
 
 #[cfg(unix)]
@@ -607,19 +621,28 @@ impl FdHolder {
         let mut cmd = ProcCommand::new("sh");
         cmd.args(["-c", &script]).process_group(0);
         let child = cmd.spawn().expect("spawn fd holder");
-        let holder = FdHolder { child };
+        let holder = FdHolder { child: Some(child) };
         wait_until_held(lockfile, Duration::from_secs(5));
         holder
     }
 
     fn kill(&mut self) {
-        kill_group(&mut self.child);
+        if let Some(child) = self.child.take() {
+            kill_group(child);
+        }
+    }
+
+    /// Is the holding shell still running? Only meaningful before `kill`.
+    fn is_alive(&mut self) -> bool {
+        self.child
+            .as_mut()
+            .is_some_and(|c| c.try_wait().unwrap().is_none())
     }
 }
 
 #[cfg(unix)]
 impl Drop for FdHolder {
     fn drop(&mut self) {
-        kill_group(&mut self.child);
+        self.kill();
     }
 }

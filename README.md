@@ -166,6 +166,13 @@ listing exactly `--pool` descriptors in slot order (fd for slot `00`, slot `01`,
 …). Leaving the unused slot fds open is harmless — only a *locked* slot counts
 against the pool.
 
+`flock` itself takes any fd number, but *your shell* may not: POSIX only
+requires redirections on fds 0-9, and strict shells hold to it — under dash
+(`/bin/sh` on Debian and Ubuntu) `exec 10<>f` is an error, since `10` parses as
+a command name. The example above is `#!/bin/bash`; for a pool that must run
+under `/bin/sh`, keep every fd single-digit (up to 7 slots alongside the main
+fd) or re-exec under bash.
+
 **Acquisition is all-or-nothing.** On a refused `-n`/`-w`, `flock` releases
 every lock it took while trying — including the main-shared lock and any slot it
 had already swept — so a failed attempt leaves *none* of your descriptors
@@ -261,10 +268,30 @@ All code is available under the MIT or Apache 2.0 license, at your option.
 mise run test        # full suite (unit + integration)
 mise run test-unit   # unit tests only
 mise run test-int    # integration tests only
+mise run test-linux  # full suite on Linux, in Docker (see Dockerfile.test)
 ```
 
 The integration suite spawns real `flock` child processes to prove the
 mutual-exclusion and death-release properties end-to-end.
+
+#### The tests are not portable for free
+
+They drive real shells and real process groups, and both of those differ
+between a developer mac and CI. A green run on macOS says nothing about Linux,
+which is what `mise run test-linux` is for — run it before pushing anything
+that touches the harness. Two differences have already cost a red CI:
+
+- **`/bin/sh` is dash on Debian and Ubuntu, bash on macOS.** POSIX only requires
+  redirections on fds 0-9, and dash holds to it: `exec 10<>f` is an error there,
+  because `10` parses as a command name. Harness scripts that open descriptors
+  must stay single-digit — see `SLOT_FD0` in `tests/fd_weighted.rs`.
+- **`kill(1)` is not one program.** BSD `kill` (macOS) treats `-KILL -<pgid>` as
+  a process group; procps-ng `kill` (Debian/Ubuntu) exits 1 and leaves the group
+  running, so holders outlive their kill and tests stall for the holder's whole
+  `sleep`. Signal process groups with `libc::killpg` — a dev-dependency for
+  exactly this — never by shelling out. Reap once, too: after a `Child` is
+  waited on, its pid can be reused, so a second `killpg` on that number can hit
+  an unrelated group.
 
 ### Performing a release
 

@@ -24,6 +24,31 @@ description = "Run integration tests only (spawns real flock processes)"
 env = { CLICOLOR = "1" }
 run = '''cargo nextest run --no-fail-fast -E 'binary(integration)' "$@"'''
 
+[tasks.test-linux]
+description = """
+Run the test suite on Linux in Docker (/bin/sh is dash)
+
+Reproduces the CI environment on a mac: the container is Debian-based, so
+`/bin/sh` is dash, not bash. That matters here because the descriptor-mode
+tests drive real shells, and dash enforces the POSIX rule that redirections
+only name fds 0-9 (`exec 10<>f` is an error there, fine under macOS's bash).
+
+Build and run are separate docker commands: `Dockerfile.test` compiles the
+test binaries (cargo-chef for the dependency layer, sccache on a cache mount
+for everything else), then `docker run` only executes them. The host
+`target/` is never touched. Runs on the host architecture, not forced to
+CI's x86_64.
+
+Extra args go to `cargo nextest run`, e.g.
+`mise run test-linux -- -E 'binary(fd_weighted)'`.
+"""
+run = '''
+set -eu
+docker build -f Dockerfile.test -t flock-linux-test .
+exec docker run --rm -t -e CLICOLOR=1 flock-linux-test \
+  cargo nextest run --no-fail-fast "$@"
+'''
+
 [tasks.cov-unit]
 description = """
 Coverage of all unit tests (no integration).

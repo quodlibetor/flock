@@ -275,6 +275,7 @@ dependencies = [
  "assert_cmd",
  "assert_fs",
  "clap",
+ "libc",
  "predicates",
  "rstest",
 ]

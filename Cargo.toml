@@ -31,6 +31,13 @@ predicates = "3.1"
 assert2 = "0.4"
 rstest = "0.26"
 
+# Tests only: the concurrency proofs SIGKILL a holder's whole process group, and
+# that must be `killpg(2)` itself. Shelling out to `kill(1)` is not portable
+# enough for it — BSD `kill` (macOS) and procps-ng `kill` (Debian/Ubuntu, so CI)
+# disagree on `-KILL -<pgid>`. The shipped binary stays libc-free.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
