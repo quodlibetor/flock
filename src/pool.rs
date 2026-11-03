@@ -15,8 +15,9 @@
 //!   single boundary a *legacy* plain-`flock <lockfile>` holder (which knows
 //!   nothing of tokens) still respects: its exclusive lock blocks every token
 //!   holder, and every token holder's shared lock blocks it. Interop is
-//!   entirely carried here, so old and new binaries stay mutually correct on
-//!   the same lockfile.
+//!   entirely carried here, so old and new binaries stay mutually exclusive
+//!   on the same lockfile. Exclusive, not fair: a legacy holder never takes
+//!   the gate below, so a reader stream starves it (the README says so).
 //! - **`<lockfile>.intent`** — the *entry gate*, an exclusive mutex taken
 //!   briefly by a reader (to pass through) and held for wait+run by a writer.
 //!   A writer holding it stops *new* readers before they can take the resource

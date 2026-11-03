@@ -104,13 +104,28 @@ continuous reader stream.
 a `SIGKILL`ed holder frees all of its tokens immediately — no stale slot files
 to garbage-collect.
 
-**Interoperates with plain exclusive holders.** Weighted mode keeps the main
-lockfile itself in the protocol: readers hold it *shared*, a full-pool writer
-holds it *exclusive*. So a process taking a plain `flock <lockfile>` exclusive
-lock (e.g. an older binary that predates `--tokens`) blocks every token holder,
-and any token holder blocks it. Old and new callers stay mutually correct on
-the same lockfile — but all callers that *do* use weighted mode must pass the
-**same `--pool`**, since the pool size defines the slot set.
+**Interoperates with plain exclusive holders, for correctness only.** Weighted
+mode keeps the main lockfile itself in the protocol: readers hold it *shared*,
+a full-pool writer holds it *exclusive*. So a process taking a plain
+`flock <lockfile>` exclusive lock (e.g. an older binary that predates
+`--tokens`) blocks every token holder, and any token holder blocks it. Old and
+new callers stay mutually exclusive on the same lockfile — but all callers that
+*do* use weighted mode must pass the **same `--pool`**, since the pool size
+defines the slot set.
+
+What a plain exclusive holder does **not** get is the writer preference above.
+It never takes the entry gate, and `flock(2)` itself prefers nobody, so while it
+waits for the lockfile every new weighted reader passes the open gate and takes
+the lockfile shared ahead of it: a steady stream of readers starves it
+indefinitely. And once it holds the lockfile it has excluded the whole pool
+whatever its own load, so every weighted waiter pays for its full run; a
+full-pool weighted writer waiting behind it holds the gate meanwhile, which
+stalls every reader too. Two repositories sharing one lockfile saw both
+directions at once, with waits of over an hour each way. A participant that
+wants fairness as well as exclusion takes tokens through this mode — in wrap
+mode, or in descriptor mode from a language without a `flock` binding (open the
+lockfile and the slot files, run `flock --lock-fd ... --slot-fds ...`, keep the
+descriptors open) — and never a bare `LOCK_EX` on the lockfile.
 
 Derived paths: weighted mode creates siblings of the lockfile —
 `<lockfile>.intent` (the writer-preference entry gate), `<lockfile>.alloc` (a
