@@ -5,7 +5,7 @@ lockfile = true
 "cargo:cargo-llvm-cov" = "latest"
 "cargo:cargo-nextest" = "latest"
 "cargo:cargo-release" = "latest"
-"github:axodotdev/cargo-dist" = { version = "0.31", exe = "dist" }
+"github:axodotdev/cargo-dist" = "0.31"
 gh = "latest"
 git-cliff = "latest"
 
