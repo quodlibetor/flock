@@ -1,21 +1,5 @@
 # Changelog
 
-## [0.0.5](https://github.com/quodlibetor/flock/compare/v0.0.4...v0.0.5) - 2026-11-13
-
-### 🐛 Bug Fixes
-
-- **(ci)** find coverage binaries in Rust 1.100's new build-dir layout by [@quodlibetor](https://github.com/quodlibetor) in [bc7aa4b](https://github.com/quodlibetor/flock/commit/bc7aa4b5ec6e6684bfdc6f4f3a22ca13838eefd2)
-- **(mise)** install cargo-dist without the exe option the github backend rejects by [@quodlibetor](https://github.com/quodlibetor) in [52c2668](https://github.com/quodlibetor/flock/commit/52c2668578b8294d19af81847a7beaf2f47f129e)
-- **(pool)** a short allocator re-sweeps the whole pool instead of parking on one slot by [@quodlibetor](https://github.com/quodlibetor) in [47ece08](https://github.com/quodlibetor/flock/commit/47ece085592316436850a4ed9798052c28839ceb)
-
-### 📚 Documentation
-
-- weighted mode's interop with plain exclusive holders is exclusion, not fairness by [@quodlibetor](https://github.com/quodlibetor) in [3ac7d13](https://github.com/quodlibetor/flock/commit/3ac7d136fcabba9742a8b14de1263d0f15cc4024)
-
-### ⚙️ Miscellaneous Tasks
-
-- Remove package.homepage from Cargo.toml by [@quodlibetor](https://github.com/quodlibetor) in [#9](https://github.com/quodlibetor/flock/pull/9)
-
 ## [0.0.4](https://github.com/quodlibetor/flock/compare/v0.0.3...v0.0.4) - 2026-08-01
 
 ### 🧪 Testing
