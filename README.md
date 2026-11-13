@@ -128,9 +128,15 @@ lockfile and the slot files, run `flock --lock-fd ... --slot-fds ...`, keep the
 descriptors open) — and never a bare `LOCK_EX` on the lockfile.
 
 Derived paths: weighted mode creates siblings of the lockfile —
-`<lockfile>.intent` (the writer-preference entry gate), `<lockfile>.alloc` (a
-brief internal slot-allocator mutex), and `<lockfile>.slots/NN` (the `N` slot
+`<lockfile>.intent` (the writer-preference entry gate), `<lockfile>.alloc` (an
+internal slot-allocator mutex), and `<lockfile>.slots/NN` (the `N` slot
 files). Like the lockfile, they are created on demand and never unlinked.
+
+A reader that finds too few free slots holds what it found and re-checks the
+whole pool every 20 ms, taking slots as any holder releases them. It keeps the
+allocator mutex while it waits, so waiting readers are served one at a time: a
+reader that needs many tokens keeps a smaller one behind it waiting, even when
+the smaller one would fit.
 
 On Windows the locks are `LockFileEx`-based like the rest of the tool; the
 concurrency proofs in the test suite are exercised on unix.
