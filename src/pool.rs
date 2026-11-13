@@ -23,9 +23,12 @@
 //!   A writer holding it stops *new* readers before they can take the resource
 //!   lock, so the resource drains and the writer is not starved by a reader
 //!   stream. (See the note on why this gate is exclusive, not shared, below.)
-//! - **`<lockfile>.alloc`** — a brief internal *allocator* mutex held only
-//!   while a reader hunts for its `K` free slots, so slot allocation is atomic
-//!   and two readers can never deadlock each grabbing a disjoint partial set.
+//! - **`<lockfile>.alloc`** — an internal *allocator* mutex held while a
+//!   reader hunts for its `K` free slots, waiting included, so slot allocation
+//!   is atomic and two readers can never deadlock each grabbing a disjoint
+//!   partial set. Waiting readers are therefore served one at a time: one that
+//!   needs many tokens keeps a smaller one behind it waiting, even when the
+//!   smaller one would fit.
 //! - **`<lockfile>.slots/NN`** — the pool itself: `N` slot files, each an
 //!   exclusive `flock`. A `K`-token reader holds `K` distinct slot fds for its
 //!   run; the count of taken slots *is* the pool's occupancy. A writer takes no
@@ -60,6 +63,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use crate::{blocking_lock, lock_with_timeout, open_lockfile, try_lock};
+
+/// How long a reader that is short of tokens waits between sweeps of the pool.
+const SWEEP_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Blocking policy for a single acquisition, derived once from `-n` / `-w`.
 #[derive(Clone, Copy)]
@@ -218,9 +224,8 @@ pub fn acquire(
         .map(|i| open_slot(&slots_dir, i))
         .collect::<Result<_>>()?;
     let refs: Vec<&File> = slot_files.iter().collect();
-    // Wrap mode owns these fds, so `lock` (helper-thread timeout) is safe and a
-    // returned `None` releases everything by dropping `slot_files`/`main_file`.
-    let Some(indices) = allocate_indices(&refs, tokens, blocking, lock)? else {
+    // A returned `None` releases everything by dropping `slot_files`/`main_file`.
+    let Some(indices) = allocate_indices(&refs, tokens, blocking)? else {
         return Ok(None);
     };
     drop(refs);
@@ -395,7 +400,7 @@ pub fn acquire_fd(
     // `Err` or `None` from `allocate_indices` releases the swept slots too.
     guard.cover(slot_fds);
     let refs: Vec<&File> = slot_files.iter().map(|f| &**f).collect();
-    let Some(indices) = allocate_indices(&refs, tokens, blocking, lock_borrowed)? else {
+    let Some(indices) = allocate_indices(&refs, tokens, blocking)? else {
         return Ok(None);
     };
 
@@ -420,28 +425,28 @@ pub fn acquire_fd(
 /// Grab `tokens` distinct free slots out of `slots` (length `pool`), holding the
 /// allocator lock. Returns the indices locked, with those locks held on the
 /// passed `File`s. Shared by wrap ([`acquire`]) and descriptor ([`acquire_fd`])
-/// mode — the only differences are where the slot `File`s come from and which
-/// blocking primitive is safe on them, so the caller passes `lock_one` (`lock`
-/// for wrap's owned fds, `lock_borrowed` for descriptor mode's caller fds). On a
-/// `None` return the partial locks stay held on the passed `File`s; the caller
-/// releases them (wrap by dropping the owned `File`s, descriptor by unlocking).
+/// mode: every slot lock here is a non-blocking attempt, so it is safe on the
+/// caller's borrowed fds as well as on owned ones. On a `None` return the
+/// partial locks stay held on the passed `File`s; the caller releases them (wrap
+/// by dropping the owned `File`s, descriptor by unlocking).
 ///
-/// Greedy: sweep non-blocking for whatever is free, and if that isn't enough,
-/// block on the lowest not-yet-held slot until a running reader frees it, then
-/// sweep again. Because the caller holds the allocator lock throughout, no other
-/// allocator can snatch a freed slot between our sweeps — a slot we saw free
-/// stays free until we take it — so this makes guaranteed forward progress with
-/// no busy-wait and no two-allocator deadlock.
+/// Greedy: sweep the whole pool for whatever is free, and if that isn't enough,
+/// sleep [`SWEEP_INTERVAL`] and sweep again, until `tokens` are held or the
+/// deadline passes. The caller holds the allocator lock throughout, so no other
+/// allocator can take a slot we were about to get, and two allocators can never
+/// deadlock each holding part of what the other needs.
+///
+/// It polls because `flock(2)` cannot wait on "any one of these fds". Blocking
+/// on one chosen slot instead waits for *that* slot's holder, however long it
+/// runs, while slots elsewhere free up and go unused; and since the allocator
+/// lock is held all that time, every other waiter stalls too.
 fn allocate_indices(
     slots: &[&File],
     tokens: usize,
     blocking: Blocking,
-    lock_one: impl Fn(&File, bool, Blocking) -> Result<bool>,
 ) -> Result<Option<Vec<usize>>> {
-    let pool = slots.len();
     let mut held: Vec<usize> = Vec::with_capacity(tokens);
     loop {
-        // Opportunistic non-blocking sweep for any free slots.
         for (i, slot) in slots.iter().enumerate() {
             if held.len() == tokens {
                 break;
@@ -454,21 +459,19 @@ fn allocate_indices(
             }
         }
         if held.len() == tokens {
-            break;
+            return Ok(Some(held));
         }
-        if let Blocking::Nonblock = blocking {
-            return Ok(None); // pool exhausted right now, and we were told not to wait
-        }
-        // Not enough free yet: block on the lowest slot we don't hold. It is
-        // held by a running reader that will release it, and no other allocator
-        // can be running (we hold the allocator lock), so this always unblocks.
-        let next = (0..pool)
-            .find(|i| !held.contains(i))
-            .expect("tokens <= pool guarantees an un-held index exists");
-        if !lock_one(slots[next], false, blocking)? {
-            return Ok(None); // -w deadline hit
-        }
-        held.push(next);
+        let pause = match blocking {
+            Blocking::Nonblock => return Ok(None),
+            Blocking::Forever => SWEEP_INTERVAL,
+            Blocking::Until(deadline) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Ok(None);
+                }
+                (deadline - now).min(SWEEP_INTERVAL)
+            }
+        };
+        thread::sleep(pause);
     }
-    Ok(Some(held))
 }

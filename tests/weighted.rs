@@ -7,6 +7,8 @@
 //!   overlap (the pool does not serialize them).
 //! - `pool_exhaustion_blocks`: a reader that would overflow the pool is refused
 //!   (`-n`), while one that still fits is admitted.
+//! - `short_waiter_takes_any_freed_slot`: a reader waiting for tokens takes
+//!   whichever slots free first, rather than waiting on one particular slot.
 //! - `writer_waits_for_drain_then_wins_over_readers`: a full-pool writer under a
 //!   continuous reader stream acquires after the in-flight readers drain — it is
 //!   not starved (writer preference), and while it waits new readers are blocked.
@@ -196,6 +198,48 @@ fn pool_exhaustion_blocks() {
     check!(
         fits.success(),
         "a reader that fits the last slot must be admitted"
+    );
+}
+
+/// A reader short of tokens takes whichever slots free up first, not one
+/// particular slot. Slot 0 is held by a long run and slots 1–2 by a short one;
+/// a 3-token waiter must get in when the short run ends, without waiting on the
+/// long run's slot. (It used to park on the lowest slot it lacked, holding the
+/// allocator lock and so stalling every other waiter as well.)
+#[test]
+fn short_waiter_takes_any_freed_slot() {
+    let dir = TempDir::new().unwrap();
+    let lockfile = dir.child("lock");
+
+    let _long = Reader::spawn(lockfile.path(), 1, 4, "30");
+    let _short = Reader::spawn(lockfile.path(), 2, 4, "1");
+    // `Reader::spawn`'s own wait is already satisfied by `_long`, so wait for
+    // `_short` explicitly: with both holding, only 1 slot is left and a 2-token
+    // probe is refused.
+    wait_until(lockfile.path(), Duration::from_secs(5), |p| {
+        !flock()
+            .args(["--tokens", "2", "--pool", "4", "-n"])
+            .arg(p)
+            .args(["true"])
+            .status()
+            .unwrap()
+            .success()
+    });
+
+    let start = Instant::now();
+    let waiter = flock()
+        .args(["--tokens", "3", "--pool", "4", "-w", "10"])
+        .arg(lockfile.path())
+        .args(["true"])
+        .status()
+        .unwrap();
+    check!(
+        waiter.success(),
+        "the waiter must acquire the slots the short run freed"
+    );
+    check!(
+        start.elapsed() < Duration::from_secs(5),
+        "the waiter waited on the long run's slot"
     );
 }
 
