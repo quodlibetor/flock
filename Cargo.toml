@@ -6,7 +6,6 @@ rust-version = "1.89"
 authors = ["Brandon W Maister <quodlibetor@gmail.com>"]
 license = "MIT, APACHE-2.0"
 repository = "https://github.com/quodlibetor/flock"
-homepage = "https://github.com/quodlibetor/flock"
 readme = "README.md"
 description = "Run a command while holding an atomic, OS-managed, death-safe file lock"
 publish = false
