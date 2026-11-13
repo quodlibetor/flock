@@ -49,18 +49,17 @@ jobs:
       - name: Run integration tests with coverage
         run: cargo llvm-cov nextest --no-report --no-fail-fast -E 'binary(integration)'
 
-      # Only upload the inputs `cargo llvm-cov report` actually needs:
-      # the .profraw files and the instrumented test binaries (which have no
-      # extension under debug/deps/). Skips the .rlib/.rmeta/.o/.d cargo
-      # build artifacts that aren't needed downstream.
+      # Only upload the inputs `cargo llvm-cov report` actually needs: the
+      # .profraw files and the instrumented executables. See the script for
+      # why it searches rather than globbing a fixed directory.
+      - name: Stage coverage data
+        run: .github/scripts/stage-coverage.sh coverage-staging
+
       - name: Upload coverage data
         uses: actions/upload-artifact@v7
         with:
           name: coverage-data-integration
-          path: |
-            target/llvm-cov-target/*.profraw
-            target/llvm-cov-target/debug/deps/*
-            !target/llvm-cov-target/debug/deps/*.*
+          path: coverage-staging/
           if-no-files-found: error
 
   test-unit:
@@ -84,14 +83,14 @@ jobs:
       - name: Run unit tests with coverage
         run: cargo llvm-cov nextest --no-report --no-fail-fast -E 'not binary(integration)'
 
+      - name: Stage coverage data
+        run: .github/scripts/stage-coverage.sh coverage-staging
+
       - name: Upload coverage data
         uses: actions/upload-artifact@v7
         with:
           name: coverage-data-unit
-          path: |
-            target/llvm-cov-target/*.profraw
-            target/llvm-cov-target/debug/deps/*
-            !target/llvm-cov-target/debug/deps/*.*
+          path: coverage-staging/
           if-no-files-found: error
 
   coverage:
@@ -122,10 +121,11 @@ jobs:
           name: coverage-data-integration
           path: coverage-staging/integration/
 
-      # Each artifact contains only .profraw files and the no-extension test
-      # binaries from debug/deps/. Profraws have unique names per test run so
-      # they accumulate; test binaries are uniquely named per test crate so
-      # they don't collide between jobs.
+      # Each artifact contains only .profraw files and the instrumented
+      # executables, at their paths under target/llvm-cov-target/. Profraws
+      # have unique names per test run so they accumulate; executables are
+      # built identically in both jobs, so an overwrite replaces a binary
+      # with the same one.
       - name: Combine coverage data
         run: |
           mkdir -p target/llvm-cov-target
@@ -135,10 +135,10 @@ jobs:
           # actions/upload-artifact strips Unix permissions, so the test
           # binaries arrive non-executable and cargo-llvm-cov skips them
           # when collecting object files. Restore +x.
-          find target/llvm-cov-target/debug/deps -maxdepth 1 -type f ! -name '*.*' -exec chmod +x {} +
+          find target/llvm-cov-target/debug -type f -exec chmod +x {} +
           echo "profraw files merged: $(find target/llvm-cov-target -name '*.profraw' | wc -l)"
-          echo "test binaries merged:"
-          find target/llvm-cov-target/debug/deps -maxdepth 1 -type f ! -name '*.*' -exec ls -l {} +
+          echo "executables merged:"
+          find target/llvm-cov-target/debug -type f -exec ls -l {} +
 
       - name: Generate coverage report
         run: |
